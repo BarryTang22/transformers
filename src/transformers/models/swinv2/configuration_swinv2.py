@@ -104,9 +104,9 @@ class Swinv2Config(BackboneConfigMixin, PretrainedConfig):
 
     def __init__(
         self,
-        image_size=224,
+        image_size=128,
         patch_size=4,
-        num_channels=3,
+        num_channels=10,
         embed_dim=96,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
@@ -124,6 +124,15 @@ class Swinv2Config(BackboneConfigMixin, PretrainedConfig):
         encoder_stride=32,
         out_features=None,
         out_indices=None,
+        decoder_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
+        norm_pix_loss=False,
+        num_classes=2,
+        group_channel_indices=[[0, 1, 2], [3, 4, 5, 6, 7], [8, 9]],  
+        # not include([0, 9] -> [B01, B09]); 
+        # include [B02, B03, B04], [B05, B06, B07, B08, B8A], [B11, B12]
+        group_embed_dims=[32, 32, 32], 
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -155,5 +164,11 @@ class Swinv2Config(BackboneConfigMixin, PretrainedConfig):
         # this indicates the channel dimension after the last stage of the model
         self.hidden_size = int(embed_dim * 2 ** (len(depths) - 1))
 
-
+        self.decoder_dim = decoder_dim
+        self.decoder_depth = decoder_depth
+        self.decoder_num_heads = decoder_num_heads
+        self.norm_pix_loss = norm_pix_loss
+        self.num_classes = num_classes
+        self.group_channel_indices = group_channel_indices
+        self.group_embed_dims = group_embed_dims
 __all__ = ["Swinv2Config"]

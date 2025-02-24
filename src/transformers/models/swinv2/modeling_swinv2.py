@@ -16,6 +16,7 @@
 
 import collections.abc
 import math
+import random
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -40,6 +41,12 @@ from ...utils import (
 )
 from ...utils.backbone_utils import BackboneMixin
 from .configuration_swinv2 import Swinv2Config
+from .swinv2_utils import get_2d_sincos_pos_embed
+
+import torch.nn.functional as F
+
+from timm.layers import trunc_normal_
+from timm.models.vision_transformer import Block
 
 
 logger = logging.get_logger(__name__)
@@ -91,7 +98,7 @@ class Swinv2EncoderOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     reshaped_hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-
+    final_mixing_mask: Optional[torch.FloatTensor] = None
 
 @dataclass
 # Copied from transformers.models.swin.modeling_swin.SwinModelOutput with Swin->Swinv2
@@ -273,6 +280,80 @@ class Swinv2DropPath(nn.Module):
         return "p={}".format(self.drop_prob)
 
 
+class Swinv2GroupPatchEmbeddings(nn.Module):
+    """
+    Multi-spectral patch embeddings that handle grouped channels separately.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        image_size, patch_size = config.image_size, config.patch_size
+        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
+        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
+        
+        self.group_channel_indices = config.group_channel_indices
+        self.group_embed_dims = config.group_embed_dims
+        
+        assert sum(self.group_embed_dims) == config.embed_dim, \
+            f"Sum of group embed dims {sum(self.group_embed_dims)} must equal total embed_dim {config.embed_dim}"
+        assert len(self.group_channel_indices) == len(self.group_embed_dims), \
+            "Number of channel groups must match number of embedding dimensions"
+        
+        # Basic configuration
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
+        self.grid_size = (image_size[0] // patch_size[0], image_size[1] // patch_size[1])
+        
+        # Create separate projection layers for each group
+        self.projections = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=len(channel_indices),
+                out_channels=embed_dim,
+                kernel_size=patch_size,
+                stride=patch_size
+            )
+            for channel_indices, embed_dim in zip(self.group_channel_indices, self.group_embed_dims)
+        ])
+
+    def maybe_pad(self, pixel_values, height, width):
+        if width % self.patch_size[1] != 0:
+            pad_values = (0, self.patch_size[1] - width % self.patch_size[1])
+            pixel_values = nn.functional.pad(pixel_values, pad_values)
+        if height % self.patch_size[0] != 0:
+            pad_values = (0, 0, 0, self.patch_size[0] - height % self.patch_size[0])
+            pixel_values = nn.functional.pad(pixel_values, pad_values)
+        return pixel_values
+
+    def forward(self, pixel_values: Optional[torch.FloatTensor]) -> Tuple[torch.Tensor, Tuple[int]]:
+        batch_size, total_channels, height, width = pixel_values.shape
+        pixel_values = self.maybe_pad(pixel_values, height, width)
+        # Process each group separately
+        group_embeddings = []
+
+        for i, channel_indices in enumerate(self.group_channel_indices):
+            # Extract channels for this group
+            group_pixels = pixel_values[:, channel_indices, :, :]
+            
+            # Project this group
+            embeddings = self.projections[i](group_pixels)  # [B, embed_dim_i, H', W']
+            
+            # Save output dimensions from first group
+            if i == 0:
+                _, _, out_height, out_width = embeddings.shape
+                output_dimensions = (out_height, out_width)
+            
+            # Reshape to [B, embed_dim_i, num_patches]
+            embeddings = embeddings.flatten(2)
+            
+            group_embeddings.append(embeddings)
+            
+        # Concatenate all group embeddings along embedding dimension
+        embeddings = torch.cat(group_embeddings, dim=1)  # [B, total_embed_dim, num_patches]
+        embeddings = embeddings.transpose(1, 2)  # [B, num_patches, total_embed_dim]
+        
+        return embeddings, output_dimensions 
+
 # Copied from transformers.models.swin.modeling_swin.SwinEmbeddings with Swin->Swinv2
 class Swinv2Embeddings(nn.Module):
     """
@@ -282,7 +363,7 @@ class Swinv2Embeddings(nn.Module):
     def __init__(self, config, use_mask_token=False):
         super().__init__()
 
-        self.patch_embeddings = Swinv2PatchEmbeddings(config)
+        self.patch_embeddings = Swinv2GroupPatchEmbeddings(config)
         num_patches = self.patch_embeddings.num_patches
         self.patch_grid = self.patch_embeddings.grid_size
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim)) if use_mask_token else None
@@ -537,6 +618,7 @@ class Swinv2SelfAttention(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
+        mixing_mask: Optional[torch.FloatTensor] = None,
     ) -> Tuple[torch.Tensor]:
         batch_size, dim, num_channels = hidden_states.shape
         mixed_query_layer = self.query(hidden_states)
@@ -562,6 +644,13 @@ class Swinv2SelfAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         relative_position_bias = 16 * torch.sigmoid(relative_position_bias)
         attention_scores = attention_scores + relative_position_bias.unsqueeze(0)
+
+        # Handle mixing mask before regular attention mask
+        if mixing_mask is not None:
+            mixing_mask = mixing_mask.reshape(batch_size, 1, 1, dim)
+            mixing_attn_mask = mixing_mask * mixing_mask.transpose(2, 3) + (1 - mixing_mask) * (1 - mixing_mask).transpose(2, 3)
+            mixing_attn_mask = 1 - mixing_attn_mask
+            attention_scores = attention_scores - 1e30 * mixing_attn_mask
 
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in Swinv2Model forward() function)
@@ -646,8 +735,9 @@ class Swinv2Attention(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
+        mixing_mask: Optional[torch.FloatTensor] = None,
     ) -> Tuple[torch.Tensor]:
-        self_outputs = self.self(hidden_states, attention_mask, head_mask, output_attentions)
+        self_outputs = self.self(hidden_states, attention_mask, head_mask, output_attentions, mixing_mask)
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
@@ -754,15 +844,28 @@ class Swinv2Layer(nn.Module):
         input_dimensions: Tuple[int, int],
         head_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
+        mixing_mask: Optional[torch.FloatTensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         height, width = input_dimensions
         batch_size, _, channels = hidden_states.size()
         shortcut = hidden_states
-
+        
         # pad hidden_states to multiples of window size
         hidden_states = hidden_states.view(batch_size, height, width, channels)
+        
         hidden_states, pad_values = self.maybe_pad(hidden_states, height, width)
         _, height_pad, width_pad, _ = hidden_states.shape
+        
+        if mixing_mask is not None:
+            mixing_mask = mixing_mask.view(batch_size, height, width, 1)
+            mixing_mask, _ = self.maybe_pad(mixing_mask, height, width)
+            
+            if self.shift_size > 0:
+                mixing_mask = torch.roll(mixing_mask, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            
+            mixing_mask_windows = window_partition(mixing_mask, self.window_size)
+            mixing_mask_windows = mixing_mask_windows.view(-1, self.window_size * self.window_size, 1)
+
         # cyclic shift
         if self.shift_size > 0:
             shifted_hidden_states = torch.roll(hidden_states, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
@@ -777,7 +880,8 @@ class Swinv2Layer(nn.Module):
             attn_mask = attn_mask.to(hidden_states_windows.device)
 
         attention_outputs = self.attention(
-            hidden_states_windows, attn_mask, head_mask, output_attentions=output_attentions
+            hidden_states_windows, attn_mask, head_mask, output_attentions=output_attentions, 
+            mixing_mask=mixing_mask_windows if mixing_mask is not None else None
         )
 
         attention_output = attention_outputs[0]
@@ -822,7 +926,7 @@ class Swinv2Stage(nn.Module):
                 input_resolution=input_resolution,
                 num_heads=num_heads,
                 drop_path_rate=drop_path[i],
-                shift_size=0 if (i % 2 == 0) else config.window_size // 2,
+                shift_size=0, #if (i % 2 == 0) else config.window_size // 2,
                 pretrained_window_size=pretrained_window_size,
             )
             blocks.append(block)
@@ -842,8 +946,10 @@ class Swinv2Stage(nn.Module):
         input_dimensions: Tuple[int, int],
         head_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
+        mixing_mask: Optional[torch.FloatTensor] = None,
     ) -> Tuple[torch.Tensor]:
         height, width = input_dimensions
+
         for i, layer_module in enumerate(self.blocks):
             layer_head_mask = head_mask[i] if head_mask is not None else None
 
@@ -852,6 +958,7 @@ class Swinv2Stage(nn.Module):
                 input_dimensions,
                 layer_head_mask,
                 output_attentions,
+                mixing_mask,
             )
 
             hidden_states = layer_outputs[0]
@@ -861,10 +968,22 @@ class Swinv2Stage(nn.Module):
             height_downsampled, width_downsampled = (height + 1) // 2, (width + 1) // 2
             output_dimensions = (height, width, height_downsampled, width_downsampled)
             hidden_states = self.downsample(hidden_states_before_downsampling, input_dimensions)
+            
+            # downsample mixing mask if provided
+            if mixing_mask is not None:
+                B = mixing_mask.shape[0]
+                mixing_mask = mixing_mask.view(B, height, width, -1)
+                mixing_mask = F.interpolate(
+                    mixing_mask.permute(0, 3, 1, 2),
+                    size=(height_downsampled, width_downsampled),
+                    mode='nearest'
+                )
+                mixing_mask = mixing_mask.permute(0, 2, 3, 1).reshape(B, -1, 1)
+
         else:
             output_dimensions = (height, width, height, width)
 
-        stage_outputs = (hidden_states, hidden_states_before_downsampling, output_dimensions)
+        stage_outputs = (hidden_states, hidden_states_before_downsampling, output_dimensions, mixing_mask)
 
         if output_attentions:
             stage_outputs += layer_outputs[1:]
@@ -906,6 +1025,7 @@ class Swinv2Encoder(nn.Module):
         output_hidden_states: Optional[bool] = False,
         output_hidden_states_before_downsampling: Optional[bool] = False,
         return_dict: Optional[bool] = True,
+        mixing_mask: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, Swinv2EncoderOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_reshaped_hidden_states = () if output_hidden_states else None
@@ -924,7 +1044,7 @@ class Swinv2Encoder(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
-                    layer_module.__call__, hidden_states, input_dimensions, layer_head_mask
+                    layer_module.__call__, hidden_states, input_dimensions, layer_head_mask, mixing_mask
                 )
             else:
                 layer_outputs = layer_module(
@@ -932,12 +1052,13 @@ class Swinv2Encoder(nn.Module):
                     input_dimensions,
                     layer_head_mask,
                     output_attentions,
+                    mixing_mask,
                 )
 
             hidden_states = layer_outputs[0]
             hidden_states_before_downsampling = layer_outputs[1]
             output_dimensions = layer_outputs[2]
-
+            mixing_mask = layer_outputs[3]
             input_dimensions = (output_dimensions[-2], output_dimensions[-1])
 
             if output_hidden_states and output_hidden_states_before_downsampling:
@@ -964,7 +1085,7 @@ class Swinv2Encoder(nn.Module):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, all_hidden_states, all_self_attentions, all_reshaped_hidden_states]
+                for v in [hidden_states, all_hidden_states, all_self_attentions, all_reshaped_hidden_states, mixing_mask]
                 if v is not None
             )
 
@@ -973,9 +1094,127 @@ class Swinv2Encoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             reshaped_hidden_states=all_reshaped_hidden_states,
+            final_mixing_mask=mixing_mask
         )
+        
 
+class Swinv2MixMAEDecoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        self.encoder_stride = config.encoder_stride
+        self.base_num_patches = (config.image_size // self.encoder_stride) ** 2
+        
+        # mask token and position embedding
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, config.decoder_dim))
+        trunc_normal_(self.mask_token, mean=0., std=.02)
+        
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, self.base_num_patches, config.decoder_dim),
+            requires_grad=False
+        )
+        
+        # decoder components
+        self.decoder_embed = nn.Linear(config.hidden_size, config.decoder_dim)
+        self.decoder_blocks = nn.ModuleList([
+            Block(
+                dim=config.decoder_dim,
+                num_heads=config.decoder_num_heads,
+                mlp_ratio=config.mlp_ratio,
+                qkv_bias=True,
+                norm_layer=nn.LayerNorm
+            ) for _ in range(config.decoder_depth)
+        ])
+        
+        self.decoder_norm = nn.LayerNorm(config.decoder_dim, eps=config.layer_norm_eps)
+        self.decoder_pred = nn.Linear(
+            config.decoder_dim, 
+            self.encoder_stride ** 2 * config.num_channels, 
+            bias=True
+        )
+        
+        self.gradient_checkpointing = False
+        self.initialize_weights()
 
+    def initialize_weights(self):
+        # initialize decoder position embedding
+        decoder_pos_embed = get_2d_sincos_pos_embed(
+            self.decoder_pos_embed.shape[-1],
+            int(self.base_num_patches**.5),
+            cls_token=False
+        )
+        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+            
+    def interpolate_pos_encoding(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Interpolate positional embeddings when input size differs from default size.
+        Args:
+            embeddings: Input embeddings to get the target size from
+        """
+        B, L, C = embeddings.shape
+        
+        # Get current grid size from sequence length
+        current_size = int(L ** 0.5)
+        # Get base grid size from initialized pos embeddings
+        base_size = int(self.base_num_patches ** 0.5)
+        
+        # Skip interpolation if sizes match
+        if current_size == base_size:
+            return self.decoder_pos_embed.expand(B * 2, -1, -1)
+            
+        # Reshape pos embedding to 2D grid
+        pos_embed = self.decoder_pos_embed  # [1, base_size*base_size, decoder_dim]
+        pos_embed = pos_embed.reshape(1, base_size, base_size, -1)  # [1, base_size, base_size, decoder_dim]
+        pos_embed = pos_embed.permute(0, 3, 1, 2)  # [1, decoder_dim, base_size, base_size]
+        
+        # Interpolate
+        pos_embed = F.interpolate(
+            pos_embed, 
+            size=(current_size, current_size),
+            mode='bicubic',
+            align_corners=False
+        )
+        
+        # Reshape back
+        pos_embed = pos_embed.permute(0, 2, 3, 1)  # [1, current_size, current_size, decoder_dim]
+        pos_embed = pos_embed.reshape(1, current_size * current_size, -1)  # [1, L, decoder_dim]
+        
+        # Expand to match batch size (including the doubled batch from mixing)
+        pos_embed = pos_embed.expand(B * 2, -1, -1)
+        
+        return pos_embed
+ 
+    def forward(self, hidden_states, mixing_mask):
+        x = self.decoder_embed(hidden_states)
+        B, L, C = x.shape
+        
+        mask_tokens = self.mask_token.expand(B, L, C)
+        x1 = x * (1 - mixing_mask) + mask_tokens * mixing_mask
+        x2 = x * mixing_mask + mask_tokens * (1 - mixing_mask)
+        x = torch.cat([x1, x2], dim=0)
+        
+        x = x + self.interpolate_pos_encoding(hidden_states)
+        
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+        
+        x = self.decoder_pred(x)
+        
+        return x
+        
 # Copied from transformers.models.swin.modeling_swin.SwinPreTrainedModel with Swin->Swinv2,swin->swinv2
 class Swinv2PreTrainedModel(PreTrainedModel):
     """
@@ -1036,6 +1275,147 @@ SWINV2_INPUTS_DOCSTRING = r"""
             Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 """
 
+class Swinv2MixMAE(nn.Module):
+    def __init__(self,
+                 config
+                 ):
+        super().__init__()
+        self.config = config
+        
+        # split image into non-overlapping patches
+        self.embeddings = Swinv2Embeddings(config)
+        self.encoder = Swinv2Encoder(config, self.embeddings.patch_grid)
+        
+        # decoder
+        self.decoder = Swinv2MixMAEDecoder(config)
+        
+        self.norm_pix_loss = getattr(config, 'norm_pix_loss', False)
+        self.range_mask_ratio = getattr(config, 'range_mask_ratio', 0.0)
+        
+    def patchify(self, imgs):
+        p = self.config.encoder_stride
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+        
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], self.config.num_channels, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h*w, p**2 * self.config.num_channels))
+        return x
+    
+    def unpatchify(self, x):
+        p = self.config.encoder_stride
+        h = w = int(x.shape[1]**.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, self.config.num_channels))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], self.config.num_channels, h * p, h * p))
+        return imgs
+    
+    def random_masking(self, x, mask_ratio=0.5):
+        B, C, H, W = x.shape
+        
+        # Calculate smallest scale size (final stage)
+        final_scale = self.config.encoder_stride  # e.g., 32
+        out_H = H // final_scale  # e.g., 224//32 = 7
+        out_W = W // final_scale
+        
+        # Generate mask at smallest scale (like MixMAE)
+        num_patches_small = out_H * out_W
+        mask = torch.zeros(1, 1, num_patches_small, device=x.device)
+        
+        # Add random range if specified
+        mask_ratio = mask_ratio + random.uniform(0.0, self.range_mask_ratio)
+        
+        # Generate noise and create mask at smallest scale
+        noise = torch.rand(1, 1, num_patches_small, device=x.device)
+        mask_idx = torch.argsort(noise, dim=2)[:, :, :int(num_patches_small * mask_ratio)]
+        mask.scatter_(2, mask_idx, 1)
+        
+        # Upsample to highest resolution (patch grid size)
+        mask = mask.reshape(1, 1, out_H, out_W)
+        patch_grid_size = (H // self.config.patch_size, W // self.config.patch_size)
+        mask = F.interpolate(mask, size=patch_grid_size, mode='nearest')
+        
+        # Format mask as before for compatibility
+        mixing_mask = mask.reshape(1, -1, 1).expand(B, -1, -1)
+        # mixing_mask = mixing_mask.transpose(1, 2)
+        
+        return mixing_mask
+        
+    def forward_loss(self, imgs, pred, mixing_mask, lambda_deriv: float = 0.1,
+            lambda_bounds: float = 0.01, min_val: float = 0.0, max_val: float = 1.2):
+        B, L, C = pred.shape
+        
+        # Split reconstructions
+        img1_rec = pred[:B//2]
+        img2_rec = pred[B//2:]
+
+        # Unmix reconstructions and compute loss
+        unmixed_rec = img1_rec * mixing_mask + img2_rec.flip(0) * (1 - mixing_mask)
+        unmixed_rec = self.unpatchify(unmixed_rec)
+
+        # Normalize if needed - now operating on full images
+        if self.norm_pix_loss:
+            # Compute mean and var across spatial dimensions (H, W)
+            mean = imgs.mean(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
+            var = imgs.var(dim=(2, 3), keepdim=True)    # [B, C, 1, 1]
+            
+            # Normalize both target and prediction
+            imgs = (imgs - mean) / (var + 1.e-6)**.5
+            unmixed_rec = (unmixed_rec - mean) / (var + 1.e-6)**.5
+
+        # 1. Reconstruction Loss (pixel-wise)
+        recon_loss = (unmixed_rec - imgs) ** 2
+        recon_loss = recon_loss.mean()
+
+        # 2. Spectral Derivative Loss (between adjacent spectral bands)
+        pred_diff = unmixed_rec[:, 1:] - unmixed_rec[:, :-1]  # [B, C-1, H, W]
+        target_diff = imgs[:, 1:] - imgs[:, :-1]  # [B, C-1, H, W]
+        deriv_loss = (pred_diff - target_diff) ** 2
+        deriv_loss = deriv_loss.mean()
+        
+        # 3. Reflectance Bounds Loss (pixel-wise)
+        bounds_loss = F.relu(min_val - unmixed_rec) + F.relu(unmixed_rec - max_val)
+        bounds_loss = bounds_loss.mean()
+        
+        # Combine losses
+        total_loss = (
+            recon_loss + 
+            lambda_deriv * deriv_loss + 
+            lambda_bounds * bounds_loss
+        )
+        
+        return total_loss, unmixed_rec
+
+    def forward(self, pixel_values, mask_ratio=0.5):
+        mixing_mask = self.random_masking(pixel_values, mask_ratio)
+        
+        embedding_output, input_dimensions = self.embeddings(pixel_values)
+        
+        # Mix patches from different images
+        mixed_embeddings = (
+            embedding_output * (1 - mixing_mask) + 
+            embedding_output.flip(0) * mixing_mask
+        )
+        
+        encoder_outputs = self.encoder(
+            mixed_embeddings,
+            input_dimensions,
+            mixing_mask=mixing_mask
+        )
+
+        hidden_states = encoder_outputs[0]
+        final_mixing_mask = encoder_outputs.final_mixing_mask if isinstance(encoder_outputs, Swinv2EncoderOutput) else encoder_outputs[4]
+        
+        reconstructed = self.decoder(hidden_states, final_mixing_mask)
+        loss = None
+        if self.training:
+            loss, rec_imgs = self.forward_loss(pixel_values, reconstructed, final_mixing_mask)
+
+        output = (rec_imgs, final_mixing_mask)
+        return ((loss,) + output) if loss is not None else output
+                
 
 @add_start_docstrings(
     "The bare Swinv2 Model transformer outputting raw hidden-states without any specific head on top.",
@@ -1086,6 +1466,7 @@ class Swinv2Model(Swinv2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: bool = False,
         return_dict: Optional[bool] = None,
+        mixing_mask: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, Swinv2ModelOutput]:
         r"""
         bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, num_patches)`, *optional*):
@@ -1118,6 +1499,7 @@ class Swinv2Model(Swinv2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            mixing_mask=mixing_mask,
         )
 
         sequence_output = encoder_outputs[0]
@@ -1462,11 +1844,11 @@ class Swinv2Backbone(Swinv2PreTrainedModel, BackboneMixin):
             attentions=outputs.attentions,
         )
 
-
 __all__ = [
     "Swinv2ForImageClassification",
     "Swinv2ForMaskedImageModeling",
     "Swinv2Model",
     "Swinv2PreTrainedModel",
     "Swinv2Backbone",
+    "Swinv2MixMAE",
 ]
