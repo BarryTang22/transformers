@@ -1282,6 +1282,16 @@ class Swinv2MixMAE(nn.Module):
         super().__init__()
         self.config = config
         
+        self.mask_tokens = nn.ParameterList([
+            nn.Parameter(torch.zeros(1, 1, dim))
+            for dim in config.group_embed_dims
+        ])
+        for mask_token in self.mask_tokens:
+            trunc_normal_(mask_token, std=.02)
+        
+        self.rgb_group_idx = 0
+        self.rgb_only_prob = getattr(config, 'rgb_only_prob', 0.3)
+        
         # split image into non-overlapping patches
         self.embeddings = Swinv2Embeddings(config)
         self.encoder = Swinv2Encoder(config, self.embeddings.patch_grid)
@@ -1291,6 +1301,45 @@ class Swinv2MixMAE(nn.Module):
         
         self.norm_pix_loss = getattr(config, 'norm_pix_loss', False)
         self.range_mask_ratio = getattr(config, 'range_mask_ratio', 0.0)
+        
+    def mask_non_rgb_embeddings(self, embedding_output):
+        """Randomly mask groups for samples in the batch:
+        1. RGB-only samples: mask all non-RGB groups
+        2. Full spectral samples: randomly mask any spectral group"""
+        B, L, _ = embedding_output.shape
+        
+        if self.training:
+            is_rgb_only = torch.rand(B, device=embedding_output.device) < self.rgb_only_prob
+            group_mask_prob = 0.25
+        else:
+            is_rgb_only = torch.zeros(B, device=embedding_output.device, dtype=torch.bool)
+            group_mask_prob = 0.0
+        
+        group_dims = self.config.group_embed_dims
+        start_idx = 0
+        masked_embeddings = []
+        
+        for i, dim in enumerate(group_dims):
+            group_embedding = embedding_output[:, :, start_idx:start_idx + dim]
+            mask = self.mask_tokens[i].expand(B, L, dim)
+            
+            if i != self.rgb_group_idx:
+                should_mask = is_rgb_only
+            else:
+                should_mask = torch.zeros_like(is_rgb_only, dtype=torch.bool)
+                
+            should_mask_group = (torch.rand(B, device=embedding_output.device) < group_mask_prob) & ~is_rgb_only
+            
+            group_embedding = torch.where(
+                (should_mask | should_mask_group).view(B, 1, 1),
+                mask,
+                group_embedding
+            )
+                
+            masked_embeddings.append(group_embedding)
+            start_idx += dim
+        
+        return torch.cat(masked_embeddings, dim=-1)
         
     def patchify(self, imgs):
         p = self.config.encoder_stride
@@ -1390,8 +1439,10 @@ class Swinv2MixMAE(nn.Module):
 
     def forward(self, pixel_values, mask_ratio=0.5):
         mixing_mask = self.random_masking(pixel_values, mask_ratio)
-        
         embedding_output, input_dimensions = self.embeddings(pixel_values)
+        
+        embedding_output = self.mask_non_rgb_embeddings(embedding_output)
+        print(embedding_output[:, 1, :])
         
         # Mix patches from different images
         mixed_embeddings = (
