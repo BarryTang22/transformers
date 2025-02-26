@@ -1442,7 +1442,7 @@ class Swinv2MixMAE(nn.Module):
         embedding_output, input_dimensions = self.embeddings(pixel_values)
         
         embedding_output = self.mask_non_rgb_embeddings(embedding_output)
-        print(embedding_output[:, 1, :])
+        # print(embedding_output[:, 1, :])
         
         # Mix patches from different images
         mixed_embeddings = (
