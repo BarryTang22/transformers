@@ -929,7 +929,7 @@ class Swinv2Stage(nn.Module):
                 input_resolution=input_resolution,
                 num_heads=num_heads,
                 drop_path_rate=drop_path[i],
-                shift_size=0, # if (i % 2 == 0) else config.window_size // 2,
+                shift_size=0 if (i % 2 == 0) else config.window_size // 2,
                 pretrained_window_size=pretrained_window_size,
             )
             blocks.append(block)
