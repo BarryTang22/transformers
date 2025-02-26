@@ -891,6 +891,7 @@ class Swinv2Layer(nn.Module):
 
         # reverse cyclic shift
         if self.shift_size > 0:
+            mixing_mask = torch.roll(mixing_mask, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
             attention_windows = torch.roll(shifted_windows, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             attention_windows = shifted_windows
@@ -898,6 +899,8 @@ class Swinv2Layer(nn.Module):
         was_padded = pad_values[3] > 0 or pad_values[5] > 0
         if was_padded:
             attention_windows = attention_windows[:, :height, :width, :].contiguous()
+            if mixing_mask is not None:
+                mixing_mask = mixing_mask[:, :height, :width, :].contiguous()
 
         attention_windows = attention_windows.view(batch_size, height * width, channels)
         hidden_states = self.layernorm_before(attention_windows)
@@ -926,7 +929,7 @@ class Swinv2Stage(nn.Module):
                 input_resolution=input_resolution,
                 num_heads=num_heads,
                 drop_path_rate=drop_path[i],
-                shift_size=0, #if (i % 2 == 0) else config.window_size // 2,
+                shift_size=0 if (i % 2 == 0) else config.window_size // 2,
                 pretrained_window_size=pretrained_window_size,
             )
             blocks.append(block)
