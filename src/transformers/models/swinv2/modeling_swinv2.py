@@ -1004,6 +1004,11 @@ class Swinv2Encoder(nn.Module):
 
         layers = []
         for i_layer in range(self.num_layers):
+            # if its third stage, use window size 14 otherwise use 7
+            # if i_layer == 2:
+            #     config.window_size = 14
+            # else:
+            #     config.window_size = 7
             stage = Swinv2Stage(
                 config=config,
                 dim=int(config.embed_dim * 2**i_layer),
@@ -1306,17 +1311,11 @@ class Swinv2MixMAE(nn.Module):
         self.range_mask_ratio = getattr(config, 'range_mask_ratio', 0.0)
         
     def mask_non_rgb_embeddings(self, embedding_output):
-        """Randomly mask groups for samples in the batch:
-        1. RGB-only samples: mask all non-RGB groups
-        2. Full spectral samples: randomly mask any spectral group"""
+        """Randomly mask groups for samples in the batch: Full spectral samples: randomly mask any spectral group"""
         B, L, _ = embedding_output.shape
         
-        if self.training:
-            is_rgb_only = torch.rand(B, device=embedding_output.device) < self.rgb_only_prob
-            group_mask_prob = 0.25
-        else:
-            is_rgb_only = torch.zeros(B, device=embedding_output.device, dtype=torch.bool)
-            group_mask_prob = 0.0
+        is_rgb_only = torch.zeros(B, device=embedding_output.device, dtype=torch.bool)
+        group_mask_prob = 0.25 if self.training else 0.0
         
         group_dims = self.config.group_embed_dims
         start_idx = 0
@@ -1326,15 +1325,14 @@ class Swinv2MixMAE(nn.Module):
             group_embedding = embedding_output[:, :, start_idx:start_idx + dim]
             mask = self.mask_tokens[i].expand(B, L, dim)
             
-            if i != self.rgb_group_idx:
-                should_mask = is_rgb_only
-            else:
-                should_mask = torch.zeros_like(is_rgb_only, dtype=torch.bool)
-                
-            should_mask_group = (torch.rand(B, device=embedding_output.device) < group_mask_prob) & ~is_rgb_only
+            # Generate random mask for this group (except RGB group which is never masked)
+            should_mask_group = torch.zeros_like(is_rgb_only, dtype=torch.bool)
+            if i != self.rgb_group_idx and group_mask_prob > 0:
+                should_mask_group = torch.rand(B, device=embedding_output.device) < group_mask_prob
             
+            # Apply masking
             group_embedding = torch.where(
-                (should_mask | should_mask_group).view(B, 1, 1),
+                should_mask_group.view(B, 1, 1),
                 mask,
                 group_embedding
             )
@@ -1422,8 +1420,8 @@ class Swinv2MixMAE(nn.Module):
         recon_loss = recon_loss.mean()
 
         # 2. Spectral Derivative Loss (between adjacent spectral bands)
-        pred_diff = unmixed_rec[:, 1:] - unmixed_rec[:, :-1]  # [B, C-1, H, W]
-        target_diff = imgs[:, 1:] - imgs[:, :-1]  # [B, C-1, H, W]
+        pred_diff = unmixed_rec[:, 1:] - unmixed_rec[:, :-1]
+        target_diff = imgs[:, 1:] - imgs[:, :-1]
         deriv_loss = (pred_diff - target_diff) ** 2
         deriv_loss = deriv_loss.mean()
         
@@ -1445,7 +1443,6 @@ class Swinv2MixMAE(nn.Module):
         embedding_output, input_dimensions = self.embeddings(pixel_values)
         
         embedding_output = self.mask_non_rgb_embeddings(embedding_output)
-        # print(embedding_output[:, 1, :])
         
         # Mix patches from different images
         mixed_embeddings = (
