@@ -294,8 +294,7 @@ class Swinv2GroupPatchEmbeddings(nn.Module):
         self.group_channel_indices = config.group_channel_indices
         self.group_embed_dims = config.group_embed_dims
         
-        assert sum(self.group_embed_dims) == config.embed_dim, \
-            f"Sum of group embed dims {sum(self.group_embed_dims)} must equal total embed_dim {config.embed_dim}"
+        print("Group embed dims: ", self.group_embed_dims)
         assert len(self.group_channel_indices) == len(self.group_embed_dims), \
             "Number of channel groups must match number of embedding dimensions"
         
@@ -373,7 +372,10 @@ class Swinv2Embeddings(nn.Module):
         else:
             self.position_embeddings = None
 
-        self.norm = nn.LayerNorm(config.embed_dim)
+
+        total_embed_dim = sum(config.group_embed_dims)
+        print("Total embed dim: ", total_embed_dim)
+        self.norm = nn.LayerNorm(total_embed_dim)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.patch_size = config.patch_size
         self.config = config
@@ -1290,12 +1292,12 @@ class Swinv2MixMAE(nn.Module):
         super().__init__()
         self.config = config
         
-        self.mask_tokens = nn.ParameterList([
-            nn.Parameter(torch.zeros(1, 1, dim))
-            for dim in config.group_embed_dims
-        ])
-        for mask_token in self.mask_tokens:
-            trunc_normal_(mask_token, std=.02)
+        # self.mask_tokens = nn.ParameterList([
+        #     nn.Parameter(torch.zeros(1, 1, dim))
+        #     for dim in config.group_embed_dims
+        # ])
+        # for mask_token in self.mask_tokens:
+        #     trunc_normal_(mask_token, std=.02)
         
         self.rgb_group_idx = 0
         self.rgb_only_prob = getattr(config, 'rgb_only_prob', 0.3)
@@ -1310,37 +1312,41 @@ class Swinv2MixMAE(nn.Module):
         self.norm_pix_loss = getattr(config, 'norm_pix_loss', False)
         self.range_mask_ratio = getattr(config, 'range_mask_ratio', 0.0)
         
-    def mask_non_rgb_embeddings(self, embedding_output):
-        """Randomly mask groups for samples in the batch: Full spectral samples: randomly mask any spectral group"""
-        B, L, _ = embedding_output.shape
+    def mask_non_rgb_embeddings(self, embedding_output, disable_masking=True):
+        if disable_masking:
+            return embedding_output
         
-        is_rgb_only = torch.zeros(B, device=embedding_output.device, dtype=torch.bool)
-        group_mask_prob = 0.25 if self.training else 0.0
+        # B, L, _ = embedding_output.shape
         
-        group_dims = self.config.group_embed_dims
-        start_idx = 0
-        masked_embeddings = []
+        # is_rgb_only = torch.zeros(B, device=embedding_output.device, dtype=torch.bool)
+        # group_mask_prob = 0.25 if self.training else 0.0
         
-        for i, dim in enumerate(group_dims):
-            group_embedding = embedding_output[:, :, start_idx:start_idx + dim]
-            mask = self.mask_tokens[i].expand(B, L, dim)
+        # group_dims = self.config.group_embed_dims
+        # start_idx = 0
+        # masked_embeddings = []
+        
+        # for i, dim in enumerate(group_dims):
+        #     group_embedding = embedding_output[:, :, start_idx:start_idx + dim]
+        #     mask = self.mask_tokens[i].expand(B, L, dim)
             
-            # Generate random mask for this group (except RGB group which is never masked)
-            should_mask_group = torch.zeros_like(is_rgb_only, dtype=torch.bool)
-            if i != self.rgb_group_idx and group_mask_prob > 0:
-                should_mask_group = torch.rand(B, device=embedding_output.device) < group_mask_prob
+        #     # Generate random mask for this group (except RGB group which is never masked)
+        #     # should_mask_group = torch.zeros_like(is_rgb_only, dtype=torch.bool)
+        #     # if i != self.rgb_group_idx and group_mask_prob > 0:
+        #     should_mask_group = torch.zeros(B, device=embedding_output.device, dtype=torch.bool)
+        #     if group_mask_prob > 0:
+        #         should_mask_group = torch.rand(B, device=embedding_output.device) < group_mask_prob
             
-            # Apply masking
-            group_embedding = torch.where(
-                should_mask_group.view(B, 1, 1),
-                mask,
-                group_embedding
-            )
+        #     # Apply masking
+        #     group_embedding = torch.where(
+        #         should_mask_group.view(B, 1, 1),
+        #         mask,
+        #         group_embedding
+        #     )
                 
-            masked_embeddings.append(group_embedding)
-            start_idx += dim
+        #     masked_embeddings.append(group_embedding)
+        #     start_idx += dim
         
-        return torch.cat(masked_embeddings, dim=-1)
+        # return torch.cat(masked_embeddings, dim=-1)
         
     def patchify(self, imgs):
         p = self.config.encoder_stride
@@ -1365,31 +1371,24 @@ class Swinv2MixMAE(nn.Module):
     def random_masking(self, x, mask_ratio=0.5):
         B, C, H, W = x.shape
         
-        # Calculate smallest scale size (final stage)
-        final_scale = self.config.encoder_stride  # e.g., 32
-        out_H = H // final_scale  # e.g., 224//32 = 7
+        final_scale = self.config.encoder_stride
+        out_H = H // final_scale
         out_W = W // final_scale
         
-        # Generate mask at smallest scale (like MixMAE)
         num_patches_small = out_H * out_W
         mask = torch.zeros(1, 1, num_patches_small, device=x.device)
         
-        # Add random range if specified
         mask_ratio = mask_ratio + random.uniform(0.0, self.range_mask_ratio)
         
-        # Generate noise and create mask at smallest scale
         noise = torch.rand(1, 1, num_patches_small, device=x.device)
         mask_idx = torch.argsort(noise, dim=2)[:, :, :int(num_patches_small * mask_ratio)]
         mask.scatter_(2, mask_idx, 1)
         
-        # Upsample to highest resolution (patch grid size)
         mask = mask.reshape(1, 1, out_H, out_W)
         patch_grid_size = (H // self.config.patch_size, W // self.config.patch_size)
         mask = F.interpolate(mask, size=patch_grid_size, mode='nearest')
         
-        # Format mask as before for compatibility
         mixing_mask = mask.reshape(1, -1, 1).expand(B, -1, -1)
-        # mixing_mask = mixing_mask.transpose(1, 2)
         
         return mixing_mask
         
@@ -1460,9 +1459,7 @@ class Swinv2MixMAE(nn.Module):
         final_mixing_mask = encoder_outputs.final_mixing_mask if isinstance(encoder_outputs, Swinv2EncoderOutput) else encoder_outputs[4]
         
         reconstructed = self.decoder(hidden_states, final_mixing_mask)
-        loss = None
-        if self.training:
-            loss, rec_imgs = self.forward_loss(pixel_values, reconstructed, final_mixing_mask)
+        loss, rec_imgs = self.forward_loss(pixel_values, reconstructed, final_mixing_mask)
 
         output = (rec_imgs, final_mixing_mask)
         return ((loss,) + output) if loss is not None else output

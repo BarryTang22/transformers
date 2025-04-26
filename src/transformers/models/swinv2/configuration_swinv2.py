@@ -170,5 +170,8 @@ class Swinv2Config(BackboneConfigMixin, PretrainedConfig):
         self.norm_pix_loss = norm_pix_loss
         self.num_classes = num_classes
         self.group_channel_indices = group_channel_indices
-        self.group_embed_dims = group_embed_dims
+        if self.embed_dim % 3 != 0:
+            self.group_embed_dims = [self.embed_dim - 2 * (self.embed_dim // 3), self.embed_dim // 3, self.embed_dim // 3]
+        else:
+            self.group_embed_dims = [self.embed_dim // 3] * 3
 __all__ = ["Swinv2Config"]
